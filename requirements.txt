@@ -1,0 +1,12 @@
+pandas
+numpy
+gensim
+scipy
+sklearn
+configparser
+Kafka
+python-dateutil
+datetime
+py4j
+pyyaml
+prefixspan

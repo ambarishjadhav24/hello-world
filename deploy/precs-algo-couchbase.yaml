@@ -1,0 +1,14 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: precs-algo-couchbase-RAND_TIME
+spec:
+  template:
+    spec:
+      containers:
+      - name: precs-python
+        image: IMAGE_NAME
+      imagePullSecrets:
+        - name: alston.artifactorypass
+      restartPolicy: Never
+  backoffLimit: 2

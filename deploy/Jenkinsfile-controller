@@ -1,0 +1,272 @@
+node('cf_slave') {
+
+try {
+	stage('Set Environment Variables'){
+		/* Set Environment Variables for the pipeline. Common environment variables are stored in the 'common-vars' configuration file on Jenkins.
+		 * The string variables from the file have a prefix of env. followed by the variable name.
+		 */
+		SCM_VARS = checkout scm
+		configFileProvider([configFile(fileId: 'common-vars', variable: 'vars')]) {
+			load "$vars"
+		}
+
+		DOCKER_PATH='feature/pyspark'
+		GIT_REPO = 'precs-python-ml-jobs'
+		SLACK_NOTIFY = 'false'
+
+		DEPLOY_ENVIRONMENT = "${params.DEPLOY_ENVIRONMENT}"
+		DEPLOY_PATH = "${params.DEPLOY_FILE_LOCATION}"
+		IMAGE_PATH="${params.IMAGE_PATH}"
+		SHARED_SERVICE_ENVIRONMENT="${params.SHARED_SERVICE_ENVIRONMENT}"
+		DEPLOY_REGIONS ="${params.DEPLOY_REGIONS}"
+		DEPLOY_REGIONS = DEPLOY_REGIONS.trim().replaceAll('"', '').split(',').collect{ it.trim()}
+		BX_CLUSTER_LIST = (DEPLOY_REGIONS.contains('default')) ? ENV_DEV_REGIONS : DEPLOY_REGIONS
+
+		IS_PROD_DEPLOYMENT = ("${DEPLOY_PATH}" == 'prod')  ? "true" : false
+
+		RUN_MOST_POP="false"
+		RUN_COLLABORATIVE_FILTERING="false"
+		RUN_VIEW_TO_BUY="false"
+		RUN_SPARK_JOB="false"
+
+		GLOBAL_CONFIG="deploy/${DEPLOY_PATH}/globalconfig.ini"
+
+		if (("${SCM_VARS.GIT_BRANCH}" == 'origin/master') || ("${SCM_VARS.GIT_BRANCH}" == 'origin/qa')) {
+			PYTHON_BRANCH="${SCM_VARS.GIT_BRANCH}"
+		}
+
+		else {
+			PYTHON_BRANCH="origin/dev"
+		}
+
+		if (("${SCM_VARS.GIT_BRANCH}" == 'origin/master') || ("${SCM_VARS.GIT_BRANCH}" == 'origin/qa')) {
+			PYTHON_BRANCH="${SCM_VARS.GIT_BRANCH}"
+		}
+
+		else {
+			PYTHON_BRANCH="origin/dev"
+		}
+
+
+		currentBuild.displayName = "${BUILD_NUMBER} - ${SCM_VARS.GIT_BRANCH} ${DEPLOY_ENVIRONMENT}"
+	}
+
+	//String[] MOST_POP_PARAMS = [];
+	List MOST_POP_PARAMS = [];
+
+		if ("${DEPLOY_ENVIRONMENT}" == '') {
+			println "DEPLOY_ENVIRONMENT not set. Branch - $SCM_VARS.GIT_BRANCH will not be deployed"
+			return
+		}
+
+	stage('Shared Services - Building the job') {
+
+			//def job_data = sh script: "cat job-list", returnStdout: true
+
+
+
+			withCredentials([string(credentialsId: 'PAPILLON_PROD_IBM_CLIENT_ID', variable: 'IBM_CLIENT_ID')]) {
+				sh("sed -i \"s?{{IBM_CLIENT_ID_KEY}}?${IBM_CLIENT_ID}?g\" ${GLOBAL_CONFIG}")
+			}
+
+			withCredentials([string(credentialsId: 'PAPILLON_PROD_IBM_CLIENT_SECRET', variable: 'IBM_CLIENT_SECRET')]) {
+				sh("sed -i \"s?{{IBM_CLIENT_SECRET_KEY}}?${IBM_CLIENT_SECRET}?g\" ${GLOBAL_CONFIG}")
+			}
+
+			sh("sed -i \"s?{{GLOBAL_CONFIG_FILE}}?${GLOBAL_CONFIG}?g\" get_strategy.py")
+
+			sh ("sudo pip install configparser")
+			sh ("python get_strategy.py")
+			sh ("cat instance.txt")
+
+			//Create a Docker image and run the job to add the status on Couchbase
+			println("Building Docker Image")
+			IMAGE_NAME="precs-algo-couchbase"
+
+
+			println("Pushing Image to Artifactory")
+			DOCKER_PATH="feature/pyspark/$DEPLOY_ENVIRONMENT"
+
+			sh("sed -i \"s?SHARED_SERVICE_NAMESPACE?$SHARED_SERVICE_ENVIRONMENT?g\" ${GLOBAL_CONFIG}")
+			sh("sed -i \"s?{{GLOBAL_CONFIG_FILE}}?${GLOBAL_CONFIG}?g\" Dockerfile-copyToCouch")
+
+			println("Pushing Image to Artifactory")
+			withCredentials([usernamePassword(credentialsId: env.DOCKER_LOGIN, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+				sh("docker login ${env.DOCKER_REGISTRY} -u$DOCKER_USERNAME -p$DOCKER_PASSWORD")
+				docker.build("$IMAGE_NAME:${BUILD_NUMBER}", "-f Dockerfile-copyToCouch .")
+				sh("docker tag $IMAGE_NAME:${BUILD_NUMBER} ${env.DOCKER_REGISTRY}/$DOCKER_PATH/$IMAGE_NAME:${BUILD_NUMBER}")
+				sh("docker tag $IMAGE_NAME:${BUILD_NUMBER} ${env.DOCKER_REGISTRY}/$DOCKER_PATH/$IMAGE_NAME:latest")
+				sh("docker push ${env.DOCKER_REGISTRY}/$DOCKER_PATH/$IMAGE_NAME:${BUILD_NUMBER}")
+				sh("docker push ${env.DOCKER_REGISTRY}/$DOCKER_PATH/$IMAGE_NAME:latest")
+			}
+
+			IMAGE_PATH="${env.DOCKER_REGISTRY}/$DOCKER_PATH/$IMAGE_NAME:${BUILD_NUMBER}"
+			echo "Image Path has been set to $IMAGE_PATH"
+
+			TIMESTAMP = new Date()
+			TIMESTAMP =  TIMESTAMP.format("MMddHHmmssS", TimeZone.getTimeZone('UTC'))
+
+
+
+		for (cluster in BX_CLUSTER_LIST) {
+			println ("Deploying in cluster $cluster")
+			BX_CLUSTER_NAME=cluster.substring(cluster.indexOf("/")+1,cluster.lastIndexOf("/"));
+			BX_REGION=cluster.substring(0,cluster.indexOf("/"));
+			BX_ZONE=cluster.substring(cluster.lastIndexOf("/")+1);
+			KUBECONFIG = "${env.KUBECONFIG_PREFIX}/${BX_CLUSTER_NAME}/kube-config-${BX_ZONE}-${BX_CLUSTER_NAME}.yml"
+			println ("Cluster $cluster is in zone $BX_REGION and cluster name is $BX_CLUSTER_NAME in the $BX_ZONE zone")
+
+			timeout(time: 15, unit: 'MINUTES') {
+				/*
+				 * Login to cloud
+				 */
+				configFileProvider([configFile(fileId: "${env.LOGIN_FILE}", variable: 'login')]) {
+					load "$login"
+				}
+			}
+
+			sh("sed -i \"s?IMAGE_NAME?${IMAGE_PATH}?g\" deploy/precs-algo-couchbase.yaml")
+			sh("sed -i \"s?RAND_TIME?${TIMESTAMP}?g\" deploy/precs-algo-couchbase.yaml")
+
+			sh("kubectl $KUBECONFIG apply -f deploy/precs-algo-couchbase.yaml -n $DEPLOY_ENVIRONMENT ${env.VALIDATE_YAML}")
+		}
+
+
+			def job_data = sh script: "cat instance.txt", returnStdout: true
+			//job_data= job_data.trim().replaceAll("^\\[|\\]\$", "")
+			job_data= job_data.trim()
+			//job_data= job_data.replaceAll("\'", "")
+
+			String[] job_list = job_data.split('\n');
+			for( String values : job_list ) {
+
+				//Remove starting and ending single quote characters
+				values = values.trim().replaceAll("^\\'|\\'\$", "").trim()
+				println("Processing Entry - $values");
+				if ("${values}" == '') {
+					println ("Skipping Blank line")
+					continue;
+				}
+				//String[] param_list = values.split('\\s+');
+				String[] param_list = [];
+
+				//Split line on spaces except if the space is within quotes
+				def m = values =~ "([^\"]\\S*|\".+?\")\\s*"
+				while (m.find()) {
+					//param_list.add(m.group(1)); // Add .replace("\"", "") to remove surrounding quotes.
+					param_list += m.group(1);
+				}
+				m = ""
+
+				println("Matcher list is $param_list");
+				echo "Algorithm name is ${param_list[1]}"
+
+
+				switch (param_list[1]) {
+					case ["MostPopular", '"Most Popular"']:
+						//RUN_MOST_POP="true"
+						//RUN_COLLABORATIVE_FILTERING="false"
+						//RUN_VIEW_TO_BUY="false"
+						RUN_SPARK_JOB="true"
+						ML_ALGORITHM_NAME="most-popular"
+						break
+
+					case ["ViewToBuy", '"View To Buy"']:
+						//RUN_MOST_POP="false"
+						//RUN_COLLABORATIVE_FILTERING="false"
+						//RUN_VIEW_TO_BUY="true"
+						RUN_SPARK_JOB="true"
+						ML_ALGORITHM_NAME="view-to-buy"
+						break
+
+					case ["ViewToView", '"View To View"']:
+						//RUN_MOST_POP="false"
+						//RUN_COLLABORATIVE_FILTERING="true"
+						//RUN_VIEW_TO_BUY="false"
+						RUN_SPARK_JOB="true"
+						ML_ALGORITHM_NAME="collaborative-filtering"
+						break
+
+					case ["BuyToBuy",'"Buy To Buy"']:
+						//RUN_MOST_POP="false"
+						//RUN_COLLABORATIVE_FILTERING="true"
+						//RUN_VIEW_TO_BUY="false"
+						RUN_SPARK_JOB="true"
+						ML_ALGORITHM_NAME="collaborative-filtering"
+						break
+
+					default:
+						echo "No Spark job available for ${param_list[1]}. Job will not be built"
+						RUN_SPARK_JOB="false"
+				}
+
+				//Running the job
+				if ("$RUN_SPARK_JOB" == "true" ) {
+					def String param_string=""
+					for (int i=1; i < param_list.size(); i++) {
+						param_string=param_string + param_list[i] + " "
+					}
+					println ("Param String is $param_string")
+
+
+					def job = build job: 'precs-simple-python', parameters: [[$class: 'StringParameterValue', name: 'DEPLOY_ENVIRONMENT', value: DEPLOY_ENVIRONMENT],[$class: 'StringParameterValue', name: 'DEPLOY_FILE_LOCATION', value: DEPLOY_PATH],[$class: 'StringParameterValue', name: 'SHARED_SERVICE_ENVIRONMENT', value: SHARED_SERVICE_ENVIRONMENT],[$class: 'StringParameterValue', name: 'BRANCH_NAME', value: "${SCM_VARS.GIT_BRANCH}"],[$class: 'StringParameterValue', name: 'ML_ALGORITHM', value: "${ML_ALGORITHM_NAME}"],[$class: 'StringParameterValue', name: 'PYTHON_PARAMS', value: "$param_string"],[$class: 'StringParameterValue', name: 'DEPLOY_REGIONS', value: "${params.DEPLOY_REGIONS}"]], propagate: false, wait: false
+
+/*
+					if ("$RUN_VIEW_TO_BUY" == "true" || "$RUN_MOST_POP" == "true") {
+						println("Running PySpark Job");
+						//def job = build job: 'precs-simple-python', parameters: [[$class: 'StringParameterValue', name: 'DEPLOY_ENVIRONMENT', value: DEPLOY_ENVIRONMENT],[$class: 'StringParameterValue', name: 'DEPLOY_FILE_LOCATION', value: DEPLOY_PATH],[$class: 'StringParameterValue', name: 'SHARED_SERVICE_ENVIRONMENT', value: SHARED_SERVICE_ENVIRONMENT],[$class: 'StringParameterValue', name: 'BRANCH_NAME', value: "${SCM_VARS.GIT_BRANCH}"],[$class: 'StringParameterValue', name: 'RUN_MOST_POP', value: "${RUN_MOST_POP}"],[$class: 'StringParameterValue', name: 'RUN_VIEW_TO_BUY', value: "${RUN_VIEW_TO_BUY}"],[$class: 'StringParameterValue', name: 'RUN_COLLABORATIVE_FILTERING', value: "${RUN_COLLABORATIVE_FILTERING}"],[$class: 'StringParameterValue', name: 'SPARK_PARAMETERS', value: "$param_string"],[$class: 'StringParameterValue', name: 'DEPLOY_REGIONS', value: "${params.DEPLOY_REGIONS}"]], propagate: false, wait: false
+
+					}
+
+					else {
+						//def job = build job: 'precs-pyspark-compute-kubernetes', parameters: [[$class: 'StringParameterValue', name: 'DEPLOY_ENVIRONMENT', value: DEPLOY_ENVIRONMENT],[$class: 'StringParameterValue', name: 'DEPLOY_FILE_LOCATION', value: DEPLOY_PATH],[$class: 'StringParameterValue', name: 'SHARED_SERVICE_ENVIRONMENT', value: SHARED_SERVICE_ENVIRONMENT],[$class: 'StringParameterValue', name: 'BRANCH_NAME', value: "${SCM_VARS.GIT_BRANCH}"],[$class: 'StringParameterValue', name: 'RUN_MOST_POP', value: "${RUN_MOST_POP}"],[$class: 'StringParameterValue', name: 'RUN_VIEW_TO_BUY', value: "${RUN_VIEW_TO_BUY}"],[$class: 'StringParameterValue', name: 'RUN_COLLABORATIVE_FILTERING', value: "${RUN_COLLABORATIVE_FILTERING}"],[$class: 'StringParameterValue', name: 'SPARK_PARAMETERS', value: "$param_string"],[$class: 'StringParameterValue', name: 'DEPLOY_REGIONS', value: "${params.DEPLOY_REGIONS}"]], propagate: false, wait: false
+
+						println("Running Python job");
+						//def job = build job: 'precs-simple-python', parameters: [[$class: 'StringParameterValue', name: 'DEPLOY_ENVIRONMENT', value: DEPLOY_ENVIRONMENT],[$class: 'StringParameterValue', name: 'DEPLOY_FILE_LOCATION', value: DEPLOY_PATH],[$class: 'StringParameterValue', name: 'BRANCH_NAME', value: "${PYTHON_BRANCH}"],[$class: 'StringParameterValue', name: 'PYTHON_PARAMS', value: "$param_string"],[$class: 'StringParameterValue', name: 'DEPLOY_REGIONS', value: "${params.DEPLOY_REGIONS}"]], propagate: false, wait: false
+
+						//sh ("sleep 30")
+
+					}
+*/
+				}
+			}
+
+		}
+
+
+ }
+
+ 
+ catch (NotSerializableException ex){
+	//currentBuild.result = 'FAILURE'
+	println("Caught NotSerializableException Exception");
+	println(ex.toString());
+	println(ex.getMessage());
+	println(ex.getStackTrace()); 
+	//return
+ }
+ 
+ catch (Exception ex){
+	currentBuild.result = 'FAILURE'
+	println(ex.toString());
+	println(ex.getMessage());
+	println(ex.getStackTrace()); 
+ }
+
+
+ finally {
+	if (currentBuild.resultIsBetterOrEqualTo('SUCCESS')) {
+		sh ("echo SUCCESS")
+		githubNotify status: "SUCCESS", credentialsId: "${env.GIT_CREDS}", repo: "${GIT_REPO}", sha: "${SCM_VARS.GIT_COMMIT}",  account : "${env.GIT_ACCOUNT}", gitApiUrl: "${env.GIT_URL}"
+		if ( "$SLACK_NOTIFY" == 'true') {
+			slackSend (teamDomain: "$env.SLACK_ORG", channel: "$env.SLACK_CHANNEL", tokenCredentialId: "$env.SLACK_TOKEN_ID", color : "$env.SLACK_COLOR_SUCCESS", message: "SUCCESS: Job '$JOB_NAME' passed for branch $SCM_VARS.GIT_BRANCH. Please check the Jenkins job for more details - $BUILD_URL")
+		}
+	}
+		
+	else {
+		sh ("echo FAILURE")
+		githubNotify status: "FAILURE", credentialsId: "${env.GIT_CREDS}", repo: "${GIT_REPO}", sha: "${SCM_VARS.GIT_COMMIT}",  account : "${env.GIT_ACCOUNT}", gitApiUrl: "${env.GIT_URL}"
+		slackSend (teamDomain: "$env.SLACK_ORG", channel: "$env.SLACK_CHANNEL", tokenCredentialId: "$env.SLACK_TOKEN_ID", color: "$env.SLACK_COLOR_FAILURE", message: "FAILURE: Job '$JOB_NAME' failed for branch $SCM_VARS.GIT_BRANCH. Please check the Jenkins job for more details - $BUILD_URL")
+	}
+ }
+}

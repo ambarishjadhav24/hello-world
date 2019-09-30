@@ -1,0 +1,285 @@
+node('cf_slave') {
+
+try {
+	stage('Set Environment Variables'){
+		/* Set Environment Variables for the pipeline. Common environment variables are stored in the 'common-vars' configuration file on Jenkins.
+		 * The string variables from the file have a prefix of env. followed by the variable name.
+		 */
+
+		SCM_VARS = checkout scm
+		configFileProvider([configFile(fileId: 'common-vars', variable: 'vars')]) {
+			load "$vars"
+		}
+
+		DEPLOY_ENVIRONMENT = "${params.DEPLOY_ENVIRONMENT}"
+		DEPLOY_PATH = "${params.DEPLOY_FILE_LOCATION}"
+		IMAGE_PATH="${params.IMAGE_PATH}"
+		ML_ALGORITHM="${params.ML_ALGORITHM}"
+		PYTHON_PARAMS="${params.PYTHON_PARAMS}"
+
+		DEPLOY_REGIONS ="${params.DEPLOY_REGIONS}"
+		DEPLOY_REGIONS = DEPLOY_REGIONS.trim().replaceAll('"', '').split(',').collect{ it.trim()}
+		BX_CLUSTER_LIST = ""
+
+		SLACK_NOTIFY = 'false'
+		IS_FEATURE_DEPLOYMENT = 'false'
+		IS_MASTER_BRANCH = 'false'
+		IS_DEV_DEPLOYMENT = 'false'
+		IS_QA_DEPLOYMENT = 'false'
+		IS_CANARY_DEPLOYMENT = 'false'
+		IS_PROD_DEPLOYMENT = 'false'
+
+		JOB_NAME=""
+		S3_URL = "https://s3.us-south.cloud-object-storage.appdomain.cloud"
+		S3_BUCKET_NAME = "wrtp-hdfs-backup"
+
+		PRODUCT_FEED_URL = "https://dev.api.ibm.com/realtimepers/development/api"
+		
+		CATALOG_OFFERING_ID = "watson-personalized-search"
+
+
+		GLOBAL_CONFIG="deploy/${DEPLOY_PATH}/globalconfig.ini"
+
+		IMAGE_NAME = 'precs-python-ml'
+		GIT_REPO = 'precs-python-ml-jobs'
+
+		currentBuild.displayName = "${BUILD_NUMBER} - ${SCM_VARS.GIT_BRANCH} ${DEPLOY_ENVIRONMENT}"
+
+		BX_CLUSTER_LIST = (DEPLOY_REGIONS.contains('default')) ? ENV_DEV_REGIONS : DEPLOY_REGIONS
+		echo "Deploy regions are set to $BX_CLUSTER_LIST"
+
+		/* 
+		 * Set deployment parameters if not specified in the pipeline.
+		 */
+		for (cluster in BX_CLUSTER_LIST) {
+			IS_PROD_DEPLOYMENT = (ENV_PROD_REGIONS.contains(cluster)) ? "true" : "false"
+			if ("${IS_PROD_DEPLOYMENT}" == 'true') {
+				println("Production cluster selected for deployment cluster")
+				PRODUCT_FEED_URL = "https://api.ibm.com/realtimepers/run/api"
+				break;
+			}
+		}
+
+		switch ("${ML_ALGORITHM}") {
+
+			case "most-popular":
+				PYTHON_FOLDER="parameterized_most_pop"
+				JOB_DEPLOY_NAME="precs-mostpop-job.yaml"
+				break
+
+			case "collaborative-filtering":
+				PYTHON_FOLDER="collaborative_filtering"
+				JOB_DEPLOY_NAME="precs-collaborative-filtering-job.yaml"
+				break
+
+			case "view-to-buy":
+				PYTHON_FOLDER="view_to_buy"
+				JOB_DEPLOY_NAME="precs-view-to-buy-job.yaml"
+				break
+
+			default:
+				JOB_DEPLOY_NAME=""
+				PYTHON_FOLDER=""
+				GLOBAL_CONFIG=""
+		}
+
+		//Set configs in the globalconfig file
+		sh("sed -i \"s?SHARED_SERVICE_NAMESPACE?$SHARED_SERVICE_ENVIRONMENT?g\" ${GLOBAL_CONFIG}")
+
+		withCredentials([string(credentialsId: env.DRUID_S3_ACCESS_KEY, variable: 'S3_ACCESS_KEY')]) {
+			sh("sed -i \"s?{{S3_ACCESS_KEY}}?${S3_ACCESS_KEY}?g\" ${GLOBAL_CONFIG}")
+		}
+
+		withCredentials([string(credentialsId: env.DRUID_S3_SECRET_KEY, variable: 'S3_SECRET_KEY')]) {
+			sh("sed -i \"s?{{S3_SECRET_KEY}}?${S3_SECRET_KEY}?g\" ${GLOBAL_CONFIG}")
+		}
+
+		sh("sed -i \"s?{{S3_BUCKET_NAME}}?${S3_BUCKET_NAME}?g\" ${GLOBAL_CONFIG}")
+		sh("sed -i \"s?{{S3_URL}}?${S3_URL}?g\" ${GLOBAL_CONFIG}")
+		sh("sed -i \"s?{{PRODUCT_FEED_URL}}?${PRODUCT_FEED_URL}?g\" ${GLOBAL_CONFIG}")
+		sh("sed -i \"s?{{CATALOG_OFFERING_ID}}?${CATALOG_OFFERING_ID}?g\" ${GLOBAL_CONFIG}")
+
+		if ("${IS_PROD_DEPLOYMENT}" == 'true') {
+			withCredentials([
+				usernamePassword(credentialsId: "CATALOG_CLIENT_ID_SECRET", usernameVariable: 'CATALOG_CLIENT_ID', passwordVariable: 'CATALOG_CLIENT_SECRET'),
+				string(credentialsId: "CATALOG_API_KEY", variable: 'CATALOG_API_KEY')
+			]){
+				sh("sed -i \"s?{{CATALOG_CLIENT_ID}}?${CATALOG_CLIENT_ID}?g\" ${GLOBAL_CONFIG}")
+				sh("sed -i \"s?{{CATALOG_CLIENT_SECRET}}?${CATALOG_CLIENT_SECRET}?g\" ${GLOBAL_CONFIG}")
+				sh("sed -i \"s?{{CATALOG_API_KEY}}?${CATALOG_API_KEY}?g\" ${GLOBAL_CONFIG}")
+			}
+		}
+		else{
+			withCredentials([
+				usernamePassword(credentialsId: "CATALOG_CLIENT_ID_SECRET_DEV", usernameVariable: 'CATALOG_CLIENT_ID', passwordVariable: 'CATALOG_CLIENT_SECRET'),
+				string(credentialsId: "CATALOG_API_KEY", variable: 'CATALOG_API_KEY')
+			]){
+				sh("sed -i \"s?{{CATALOG_CLIENT_ID}}?${CATALOG_CLIENT_ID}?g\" ${GLOBAL_CONFIG}")
+				sh("sed -i \"s?{{CATALOG_CLIENT_SECRET}}?${CATALOG_CLIENT_SECRET}?g\" ${GLOBAL_CONFIG}")
+				sh("sed -i \"s?{{CATALOG_API_KEY}}?${CATALOG_API_KEY}?g\" ${GLOBAL_CONFIG}")
+			}
+		}
+
+
+		sh("sed -i \"s?{{PYTHON_FOLDER}}?${PYTHON_FOLDER}?g\" Dockerfile")
+		sh("sed -i \"s?{{GLOBAL_CONFIG_FILE}}?${GLOBAL_CONFIG}?g\" Dockerfile")
+		sh("sed -i \"s?{{DEPLOY_FILE_LOCATION}}?${DEPLOY_PATH}?g\" Dockerfile")
+		sh("sed -i \"s?{{JOB_DEPLOY_NAME}}?${JOB_DEPLOY_NAME}?g\" Dockerfile")
+
+		
+		//sh("cp -rf ${GLOBAL_CONFIG} ${PYTHON_FOLDER}/globalconfig.ini")
+		//sh("cp -rf deploy/${DEPLOY_PATH}/${JOB_DEPLOY_NAME} ${PYTHON_FOLDER}/precs-python-ml.yaml")
+	}
+
+	println ("Building Branch - $SCM_VARS.GIT_BRANCH")
+
+	/*
+	 * Do not deploy if the Deploy environment is not set.
+	 */
+	if ("${DEPLOY_ENVIRONMENT}" == '') {
+		println "Branch - $SCM_VARS.GIT_BRANCH doesn't need to be deployed"
+		return
+	}
+
+	stage('Build Docker images') {
+
+		if ("${IMAGE_PATH}" != '') {
+			echo "Skipping the Push-to-Artifactory phase. Deploying using image - ${params.IMAGE_PATH}"
+			return
+		}
+
+
+
+		println("Building Docker Image")
+
+		//sh("sed -i \"s?PYTHON_PARAMS?${PYTHON_PARAMS}?g\" Dockerfile")
+
+		/*
+		 * Set the path of the docker repo on Artifactory.
+		 */
+		if ( ("${IS_DEV_DEPLOYMENT}" == 'true') || ("${IS_QA_DEPLOYMENT}" == 'true') ) {
+			DOCKER_PATH="development/$DEPLOY_ENVIRONMENT"
+		}
+
+		else if( ("${IS_CANARY_DEPLOYMENT}" == 'true') || ("${IS_PROD_DEPLOYMENT}" == 'true') ) {
+			DOCKER_PATH="prod/$DEPLOY_ENVIRONMENT"
+		}
+
+		else if( ("${IS_FEATURE_DEPLOYMENT}" == 'true') ) {
+			DOCKER_PATH="feature/$DEPLOY_ENVIRONMENT"
+		}
+
+		else {
+			DOCKER_PATH="manual/$DEPLOY_ENVIRONMENT"
+		}
+
+		println("Pushing Image to Artifactory")
+		withCredentials([usernamePassword(credentialsId: env.DOCKER_LOGIN, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+			sh("docker login ${env.DOCKER_REGISTRY} -u$DOCKER_USERNAME -p$DOCKER_PASSWORD")
+			docker.build("$IMAGE_NAME:${BUILD_NUMBER}", " .")
+			sh("docker tag $IMAGE_NAME:${BUILD_NUMBER} ${env.DOCKER_REGISTRY}/$DOCKER_PATH/$IMAGE_NAME:${BUILD_NUMBER}")
+			sh("docker tag $IMAGE_NAME:${BUILD_NUMBER} ${env.DOCKER_REGISTRY}/$DOCKER_PATH/$IMAGE_NAME:latest")
+			sh("docker push ${env.DOCKER_REGISTRY}/$DOCKER_PATH/$IMAGE_NAME:${BUILD_NUMBER}")
+			sh("docker push ${env.DOCKER_REGISTRY}/$DOCKER_PATH/$IMAGE_NAME:latest")
+		}
+
+		IMAGE_PATH="${env.DOCKER_REGISTRY}/$DOCKER_PATH/$IMAGE_NAME:${BUILD_NUMBER}"
+		echo "Image Path has been set to $IMAGE_PATH"
+	}
+
+
+	stage('Deploy to Kubernetes') {
+		/*
+		 * Run the deployment steps on each deployment cluster
+		 */
+		for (cluster in BX_CLUSTER_LIST) {
+			println ("Deploying in cluster $cluster")
+			BX_CLUSTER_NAME=cluster.substring(cluster.indexOf("/")+1,cluster.lastIndexOf("/"));
+			BX_REGION=cluster.substring(0,cluster.indexOf("/"));
+			BX_ZONE=cluster.substring(cluster.lastIndexOf("/")+1);
+			KUBECONFIG = "${env.KUBECONFIG_PREFIX}/${BX_CLUSTER_NAME}/kube-config-${BX_ZONE}-${BX_CLUSTER_NAME}.yml"
+			println ("Cluster $cluster is in zone $BX_REGION and cluster name is $BX_CLUSTER_NAME in the $BX_ZONE zone")
+
+			timeout(time: 15, unit: 'MINUTES') {
+				/*
+				 * Login to cloud
+				 */
+				configFileProvider([configFile(fileId: "${env.LOGIN_FILE}", variable: 'login')]) {
+					load "$login"
+				}
+			}
+
+			/*
+			 * Copy the original deploy folder
+			 */
+			TEMP_DEPLOY_FOLDER = "/tmp/deploy"
+			sh ("rm -rf $TEMP_DEPLOY_FOLDER")
+			sh ("cp -Rf deploy/ $TEMP_DEPLOY_FOLDER")
+
+			DEPLOY_FOLDER = DEPLOY_PATH
+			DEPLOY_JOB = "${TEMP_DEPLOY_FOLDER}/${DEPLOY_FOLDER}/${JOB_DEPLOY_NAME}"
+
+			if ("${IS_PROD_DEPLOYMENT}" == 'true') {
+
+			}
+
+			timeout(time: 5, unit: 'MINUTES') {
+				println "Deploying artifacts on $BX_CLUSTER_NAME"
+				// Create namespace if it doesn't exist
+				sh("kubectl $KUBECONFIG get ns ${DEPLOY_ENVIRONMENT} || kubectl $KUBECONFIG create ns ${DEPLOY_ENVIRONMENT}")
+
+				withCredentials([usernamePassword(credentialsId: env.DOCKER_LOGIN, usernameVariable: 'DOCKER_USERNAME', passwordVariable: 'DOCKER_PASSWORD')]) {
+					sh "kubectl $KUBECONFIG --namespace=${DEPLOY_ENVIRONMENT} get secret ${env.KUBE_SECRET_NAME} || kubectl $KUBECONFIG --namespace=${DEPLOY_ENVIRONMENT} create secret docker-registry ${env.KUBE_SECRET_NAME} --docker-server=${env.DOCKER_REGISTRY} --docker-username=${DOCKER_USERNAME} --docker-password=${DOCKER_PASSWORD} --docker-email=${DOCKER_USERNAME}"
+				}
+
+				TIMESTAMP = new Date()
+				TIMESTAMP =  TIMESTAMP.format("MMddHHmmssS", TimeZone.getTimeZone('UTC'))
+				BRANCH=SCM_VARS.GIT_BRANCH.substring(SCM_VARS.GIT_BRANCH.lastIndexOf("/")+1);
+				TIMESTAMP="$TIMESTAMP-$BRANCH"
+
+
+
+				sh("sed -i \"s?IMAGE_NAME?$IMAGE_PATH?g\" ${DEPLOY_JOB}")
+				sh("sed -i \"s?RAND_TIME?${TIMESTAMP}?g\" ${DEPLOY_JOB}")
+				sh("sed -i \"s?PYTHON_PARAMS?${PYTHON_PARAMS}?g\" ${DEPLOY_JOB}")
+
+
+				sh("kubectl $KUBECONFIG --namespace=${DEPLOY_ENVIRONMENT} apply -f ${DEPLOY_JOB} ${env.VALIDATE_YAML}")
+			}
+
+			//TODO: Need to add Component Specific readiness probe
+			println "Sleeping for 2 minutes for the service to start"
+			sh("sleep 120")
+
+		}
+	}
+ }
+
+catch (Exception ex){
+	currentBuild.result = 'FAILURE'
+	println(ex.toString());
+	println(ex.getMessage());
+	println(ex.getStackTrace()); 
+ }
+ 
+ finally {
+	/*
+	 * Notify GitHub and Slack of the result
+	 */
+	if (currentBuild.resultIsBetterOrEqualTo('SUCCESS')) {
+		sh ("echo SUCCESS")
+		githubNotify status: "SUCCESS", credentialsId: "${env.GIT_CREDS}", repo: "${GIT_REPO}", sha: "${SCM_VARS.GIT_COMMIT}",  account : "${env.GIT_ACCOUNT}", gitApiUrl: "${env.GIT_URL}"
+		if ( "$SLACK_NOTIFY" == 'true') {
+			slackSend (teamDomain: "$env.SLACK_ORG", channel: "$env.SLACK_CHANNEL", tokenCredentialId: "$env.SLACK_TOKEN_ID", color : "$env.SLACK_COLOR_SUCCESS", message: "SUCCESS: Job '$JOB_NAME' passed for branch $SCM_VARS.GIT_BRANCH. Please check the Jenkins job for more details - $BUILD_URL")
+		}
+	}
+
+	else {
+		sh ("echo FAILURE")
+		githubNotify status: "FAILURE", credentialsId: "${env.GIT_CREDS}", repo: "${GIT_REPO}", sha: "${SCM_VARS.GIT_COMMIT}",  account : "${env.GIT_ACCOUNT}", gitApiUrl: "${env.GIT_URL}"
+		if ( "$SLACK_NOTIFY" == 'true') {
+			slackSend (teamDomain: "$env.SLACK_ORG", channel: "$env.SLACK_CHANNEL", tokenCredentialId: "$env.SLACK_TOKEN_ID", color: "$env.SLACK_COLOR_FAILURE", message: "FAILURE: Job '$JOB_NAME' failed for branch $SCM_VARS.GIT_BRANCH. Please check the Jenkins job for more details - $BUILD_URL")
+		}
+	}
+ }
+}

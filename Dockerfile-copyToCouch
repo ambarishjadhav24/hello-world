@@ -1,0 +1,9 @@
+FROM wce-wrtp-docker-local.artifactory.swg-devops.com/base-images/precs-couchbase/precs-couchbase-job:9
+
+COPY {{GLOBAL_CONFIG_FILE}} /app/globalconfig.ini
+COPY instance_to_couchbase.py /app/
+COPY instance.txt /app/
+
+WORKDIR /app
+
+CMD ["python", "instance_to_couchbase.py"]

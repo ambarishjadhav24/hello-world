@@ -1,0 +1,12 @@
+pandas
+numpy
+scipy
+pywebhdfs
+configparser
+Kafka
+python-dateutil
+datetime
+py4j
+pyyaml
+prefixspan
+boto3

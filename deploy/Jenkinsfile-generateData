@@ -1,0 +1,79 @@
+node('cf_slave') {
+
+try {
+	stage('Set Environment Variables'){
+		/* Set Environment Variables for the pipeline. Common environment variables are stored in the 'common-vars' configuration file on Jenkins.
+		 * The string variables from the file have a prefix of env. followed by the variable name.
+		 */
+		SCM_VARS = checkout scm
+		configFileProvider([configFile(fileId: 'common-vars', variable: 'vars')]) {
+			load "$vars"
+		}
+
+		GIT_REPO = 'precs-python-ml-jobs'
+		SLACK_NOTIFY = 'false'
+		DEPLOY_PATH = "${params.DEPLOY_FILE_LOCATION}"
+
+		GLOBAL_CONFIG="deploy/${DEPLOY_PATH}/globalconfig.ini"
+
+		IS_PROD_DEPLOYMENT = ("${DEPLOY_PATH}" == 'prod')  ? "true" : false
+
+		currentBuild.displayName = "${BUILD_NUMBER} - ${SCM_VARS.GIT_BRANCH}"
+	}
+
+
+		stage('Shared Services - Building the job') {
+
+			withCredentials([string(credentialsId: 'PAPILLON_PROD_IBM_CLIENT_ID', variable: 'IBM_CLIENT_ID')]) {
+				sh("sed -i \"s?{{IBM_CLIENT_ID_KEY}}?${IBM_CLIENT_ID}?g\" ${GLOBAL_CONFIG}")
+			}
+
+			withCredentials([string(credentialsId: 'PAPILLON_PROD_IBM_CLIENT_SECRET', variable: 'IBM_CLIENT_SECRET')]) {
+				sh("sed -i \"s?{{IBM_CLIENT_SECRET_KEY}}?${IBM_CLIENT_SECRET}?g\" ${GLOBAL_CONFIG}")
+			}
+
+			sh("sed -i \"s?{{GLOBAL_CONFIG_FILE}}?${GLOBAL_CONFIG}?g\" get_strategy.py")
+
+			sh ("sudo pip install configparser")
+			sh ("python get_strategy.py")
+			sh ("cat instance.txt")
+		}
+
+		
+	stage('Deploy to Artifactory') {
+		
+			echo "Copying Data file to Artifactory"
+			withCredentials([string(credentialsId: env.ARTIFACTORY_API_KEY, variable: 'DOCKER_PASSWORD')]) {
+				sh ("curl -H 'X-JFrog-Art-Api: $DOCKER_PASSWORD' -T instance.txt \"${env.ARTIFACTORY_GENERIC_REPO}/precs-algo/instance.txt\"")
+			}
+
+	}
+
+ }
+
+ catch (Exception ex){
+	currentBuild.result = 'FAILURE'
+	println(ex.toString());
+	println(ex.getMessage());
+	println(ex.getStackTrace()); 
+ }
+
+
+ finally {
+	if (currentBuild.resultIsBetterOrEqualTo('SUCCESS')) {
+		sh ("echo SUCCESS")
+		//githubNotify status: "SUCCESS", credentialsId: "${env.GIT_CREDS}", repo: "${GIT_REPO}", sha: "${SCM_VARS.GIT_COMMIT}",  account : "${env.GIT_ACCOUNT}", gitApiUrl: "${env.GIT_URL}"
+		if ( "$SLACK_NOTIFY" == 'true') {
+			//slackSend (teamDomain: "$env.SLACK_ORG", channel: "$env.SLACK_CHANNEL", tokenCredentialId: "$env.SLACK_TOKEN_ID", color : "$env.SLACK_COLOR_SUCCESS", message: "SUCCESS: Job '$JOB_NAME' passed for branch $SCM_VARS.GIT_BRANCH. Please check the Jenkins job for more details - $BUILD_URL")
+		}
+	}
+		
+	else {
+		sh ("echo FAILURE")
+		//githubNotify status: "FAILURE", credentialsId: "${env.GIT_CREDS}", repo: "${GIT_REPO}", sha: "${SCM_VARS.GIT_COMMIT}",  account : "${env.GIT_ACCOUNT}", gitApiUrl: "${env.GIT_URL}"
+		if ( "$SLACK_NOTIFY" == 'true') {
+			//slackSend (teamDomain: "$env.SLACK_ORG", channel: "$env.SLACK_CHANNEL", tokenCredentialId: "$env.SLACK_TOKEN_ID", color: "$env.SLACK_COLOR_FAILURE", message: "FAILURE: Job '$JOB_NAME' failed for branch $SCM_VARS.GIT_BRANCH. Please check the Jenkins job for more details - $BUILD_URL")
+		}
+	}
+ }
+}
